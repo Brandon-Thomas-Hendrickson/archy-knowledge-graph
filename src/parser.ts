@@ -1,11 +1,14 @@
 import { App, TFile } from 'obsidian';
 import { NoteLinks, LinkType } from './types';
 
-// Matches both full keywords and shorthands:
-//   leadsto@note  dependson@note  informedby@note
-//   >@note        <@note          !@note
-// Groups: [1] full keyword | [2] shorthand char | [3] target note name
-export const INLINE_TAG_REGEX = /(?:\b(leadsto|dependson|informedby)|([><!]))@([\w\-]+)/g;
+// Matches both full keywords and shorthands, with quoted or unquoted targets:
+//   leadsto@note           dependson@note          informedby@note
+//   leadsto@"note name"    dependson@"note name"   informedby@"note name"
+//   >@note  <@note  !@note    (shorthands, quoted also supported)
+//
+// Groups: [1] full keyword | [2] shorthand char
+//         [3] quoted target (spaces allowed) | [4] unquoted target ([\w\-]+)
+export const INLINE_TAG_REGEX = /(?:\b(leadsto|dependson|informedby)|([><!]))@(?:"([^"]+)"|([\w\-]+))/g;
 
 const SHORTHAND_MAP: Record<string, string> = {
     '>': 'leadsto',
@@ -16,7 +19,7 @@ const SHORTHAND_MAP: Record<string, string> = {
 /** Resolve link type and target note from a regex match. Returns null if the match is invalid. */
 export function resolveTagMatch(m: RegExpExecArray): { type: string; target: string } | null {
     const type   = m[1] || SHORTHAND_MAP[m[2]];
-    const target = m[3];
+    const target = m[3] || m[4];   // m[3] = quoted target, m[4] = unquoted target
     if (!type || !target) return null;
     return { type, target };
 }
@@ -71,8 +74,10 @@ export async function parseNoteLinks(file: TFile, app: App): Promise<NoteLinks> 
  * Build a lookup map from every note name → its NoteLinks.
  * Pass `infer = false` to skip bidirectional inference (used by global graph
  * views that want to show only explicitly-declared relationships).
+ * Pass `reduceTransitive = true` to remove edges that are implied by a
+ * longer path (transitive reduction of the leadsto graph).
  */
-export async function buildFullGraph(app: App, infer = true): Promise<Map<string, NoteLinks>> {
+export async function buildFullGraph(app: App, infer = true, reduceTransitive = false): Promise<Map<string, NoteLinks>> {
     const graph = new Map<string, NoteLinks>();
     const mdFiles = app.vault.getMarkdownFiles();
     await Promise.all(
@@ -82,6 +87,7 @@ export async function buildFullGraph(app: App, infer = true): Promise<Map<string
         })
     );
     if (infer) inferBidirectionalLinks(graph);
+    if (reduceTransitive) applyTransitiveReduction(graph);
     return graph;
 }
 
@@ -113,6 +119,72 @@ export function inferBidirectionalLinks(graph: Map<string, NoteLinks>): void {
             }
         }
     }
+}
+
+/**
+ * Apply transitive reduction to the leadsto graph (in-memory only).
+ *
+ * If A→B, A→C, and B→C all exist, then A→C is redundant — it is already
+ * "inherited" through B. This function removes such redundant edges so that
+ * only the minimal set of connections needed to imply all reachability is kept.
+ *
+ * The corresponding dependson back-edges are also cleaned up.
+ *
+ * A snapshot of the original leadsto arrays is used for path-finding so that
+ * earlier removals do not affect reachability checks for later notes.
+ */
+export function applyTransitiveReduction(graph: Map<string, NoteLinks>): void {
+    // Snapshot ALL leadsto arrays first to ensure path-finding uses the
+    // original graph, not a partially-reduced one.
+    const snapshot = new Map<string, string[]>();
+    for (const [name, links] of graph) {
+        snapshot.set(name, [...links.leadsto]);
+    }
+
+    for (const [noteA, linksA] of graph) {
+        const originalLeadsto = snapshot.get(noteA) ?? [];
+        const toRemove = new Set<string>();
+
+        for (const noteC of originalLeadsto) {
+            // Check if noteC is reachable from noteA via any other direct
+            // neighbour noteB (i.e. A→B→…→C with B ≠ C exists).
+            for (const noteB of originalLeadsto) {
+                if (noteB === noteC) continue;
+                if (isReachableLeadsto(snapshot, noteB, noteC, new Set([noteA]))) {
+                    toRemove.add(noteC);
+                    break;
+                }
+            }
+        }
+
+        if (toRemove.size > 0) {
+            linksA.leadsto = linksA.leadsto.filter(n => !toRemove.has(n));
+            // Remove the back-edges from the target notes' dependson arrays.
+            for (const noteC of toRemove) {
+                const linksC = graph.get(noteC);
+                if (linksC) {
+                    linksC.dependson = linksC.dependson.filter(n => n !== noteA);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Check whether `to` is reachable from `from` by following leadsto edges
+ * in the snapshot. `visited` prevents infinite loops on cycles.
+ */
+function isReachableLeadsto(
+    snapshot: Map<string, string[]>,
+    from: string,
+    to: string,
+    visited: Set<string>
+): boolean {
+    if (visited.has(from)) return false;
+    const children = snapshot.get(from) ?? [];
+    if (children.includes(to)) return true;
+    const nextVisited = new Set([...visited, from]);
+    return children.some(n => isReachableLeadsto(snapshot, n, to, nextVisited));
 }
 
 /**

@@ -40,10 +40,17 @@ export class ArchiTreeView extends ItemView {
     private currentMode: 'folio' | 'mindmap' | 'network';
     private forceRenderer: ForceGraphRenderer | null = null;
 
+    // Mindmap: whether labels are always visible (vs hover-only)
+    private mmShowLabels = false;
+
+    // Whether to apply transitive reduction (inheritance collapse)
+    private applyInheritance = false;
+
     // toggle button references
-    private folioBtn:   HTMLButtonElement | null = null;
-    private mindmapBtn: HTMLButtonElement | null = null;
-    private networkBtn: HTMLButtonElement | null = null;
+    private folioBtn:     HTMLButtonElement | null = null;
+    private mindmapBtn:   HTMLButtonElement | null = null;
+    private networkBtn:   HTMLButtonElement | null = null;
+    private inheritBtn:   HTMLButtonElement | null = null;
 
     constructor(leaf: WorkspaceLeaf, plugin: ArchiPlugin) {
         super(leaf);
@@ -62,11 +69,23 @@ export class ArchiTreeView extends ItemView {
         contentEl.empty();
         contentEl.addClass('archy-view');
 
-        // ── View-mode toggle bar (the only header element) ───────────────────
+        // ── View-mode toggle bar ───────────────────────────────────────────
         const toggle = contentEl.createDiv({ cls: 'archy-view-toggle' });
         this.folioBtn   = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'Folio' });
         this.mindmapBtn = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'Mindmap' });
         this.networkBtn = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'Network' });
+
+        // Separator between view-mode buttons and modifier buttons
+        toggle.createSpan({ cls: 'archy-toggle-sep' });
+
+        // Inherit toggle: collapse transitive connections
+        this.inheritBtn = toggle.createEl('button', {
+            cls: 'archy-toggle-btn archy-toggle-modifier',
+            text: 'Inherit',
+        });
+        this.inheritBtn.title =
+            'Collapse redundant connections that are implied by a longer path (transitive reduction)';
+
         this.updateToggleBtns();
 
         this.folioBtn.addEventListener('click', () => {
@@ -84,8 +103,13 @@ export class ArchiTreeView extends ItemView {
             this.updateToggleBtns();
             this.refresh();
         });
+        this.inheritBtn.addEventListener('click', () => {
+            this.applyInheritance = !this.applyInheritance;
+            this.updateToggleBtns();
+            this.refresh();
+        });
 
-        // ── Tree / graph container ───────────────────────────────────────────
+        // ── Tree / graph container ───────────────────────────────────────
         this.treeContainerEl = contentEl.createDiv({ cls: 'archy-tree-container' });
 
         await this.refresh();
@@ -95,6 +119,7 @@ export class ArchiTreeView extends ItemView {
         this.folioBtn?.classList.toggle(  'active', this.currentMode === 'folio');
         this.mindmapBtn?.classList.toggle('active', this.currentMode === 'mindmap');
         this.networkBtn?.classList.toggle('active', this.currentMode === 'network');
+        this.inheritBtn?.classList.toggle('active', this.applyInheritance);
     }
 
     async refresh() {
@@ -107,17 +132,17 @@ export class ArchiTreeView extends ItemView {
         this.treeContainerEl.empty();
         this.treeContainerEl.style.fontSize = `${this.plugin.settings.folioFontSize}px`;
 
-        // ── Network: full-vault force graph ───────────────────────────────────
+        // ── Network: full-vault force graph ───────────────────────────────
         if (this.currentMode === 'network') {
-            const rawGraph = await buildFullGraph(this.app, false);
+            const rawGraph = await buildFullGraph(this.app, false, this.applyInheritance);
             const rootName = this.app.workspace.getActiveFile()?.basename ?? null;
             this.forceRenderer = new ForceGraphRenderer(this.app, rootName);
             this.forceRenderer.mount(this.treeContainerEl, rawGraph);
             return;
         }
 
-        // ── Folio / Mindmap: active-note tree ─────────────────────────────────
-        this.graph = await buildFullGraph(this.app);
+        // ── Folio / Mindmap: active-note tree ─────────────────────────────
+        this.graph = await buildFullGraph(this.app, true, this.applyInheritance);
 
         const activeFile = this.app.workspace.getActiveFile();
         this.rootName = activeFile ? activeFile.basename : null;
@@ -367,11 +392,23 @@ export class ArchiTreeView extends ItemView {
     // ── Mindmap SVG renderer ──────────────────────────────────────────────────
 
     private renderMindmap(container: HTMLElement, rootNode: TreeNode, parentNodes: TreeNode[]) {
-        // ── Build MmNode trees ────────────────────────────────────────────────
+        // ── Labels control bar ────────────────────────────────────────────
+        const mmControls = document.createElement('div');
+        mmControls.className = 'archy-mm-controls';
+
+        const labelsBtn = document.createElement('button');
+        labelsBtn.className = 'archy-toggle-btn archy-toggle-modifier'
+            + (this.mmShowLabels ? ' active' : '');
+        labelsBtn.textContent = 'Labels';
+        labelsBtn.title = 'Always show node names (default: hover to reveal)';
+        mmControls.appendChild(labelsBtn);
+        container.appendChild(mmControls);
+
+        // ── Build MmNode trees ────────────────────────────────────────────
         const mmRoot     = toMmNode(rootNode);
         const mmParents  = parentNodes.map(p => toMmNode(p));
 
-        // ── Compute required band widths ──────────────────────────────────────
+        // ── Compute required band widths ──────────────────────────────────
         const childBand   = slotW(mmRoot);
         const parentBand  = mmParents.length > 0
             ? mmParents.reduce((acc, p) => acc + slotW(p), 0) + (mmParents.length - 1) * MM_H_GAP
@@ -379,17 +416,17 @@ export class ArchiTreeView extends ItemView {
         const innerW      = Math.max(childBand, parentBand, MM_SLOT);
         const totalWidth  = innerW + MM_PAD * 2;
 
-        // ── Place root ────────────────────────────────────────────────────────
+        // ── Place root ────────────────────────────────────────────────────
         const rootCX  = totalWidth / 2;
         const rootY   = MM_PAD + (mmParents.length > 0 ? MM_V_GAP : 0);
 
         mmRoot.x = rootCX;
         mmRoot.y = rootY;
 
-        // ── Layout children downward ──────────────────────────────────────────
+        // ── Layout children downward ──────────────────────────────────────
         layoutDown(mmRoot.children, rootCX, rootY + MM_V_GAP);
 
-        // ── Layout parents upward ─────────────────────────────────────────────
+        // ── Layout parents upward ─────────────────────────────────────────
         if (mmParents.length > 0) {
             let startX = totalWidth / 2 - parentBand / 2;
             for (const mp of mmParents) {
@@ -402,7 +439,7 @@ export class ArchiTreeView extends ItemView {
             }
         }
 
-        // ── Compute SVG height ────────────────────────────────────────────────
+        // ── Compute SVG height ────────────────────────────────────────────
         let maxY = rootY;
         walkMm(mmRoot,    n => { if (n.y > maxY) maxY = n.y; });
         for (const mp of mmParents) walkMm(mp, n => { if (n.y > maxY) maxY = n.y; });
@@ -413,12 +450,20 @@ export class ArchiTreeView extends ItemView {
         const svgHeight = (maxY - minY) + MM_R * 2 + MM_PAD * 2 + 24; // 24 for label text
         const offsetY   = minY - MM_PAD - MM_R;   // shift everything so top = 0
 
-        // ── Create pan/zoom wrapper ───────────────────────────────────────────
+        // ── Create pan/zoom wrapper ───────────────────────────────────────
         const wrapper = document.createElement('div');
-        wrapper.className = 'archy-mm-wrapper';
+        wrapper.className = 'archy-mm-wrapper'
+            + (this.mmShowLabels ? ' archy-mm-labels-always' : '');
         container.appendChild(wrapper);
 
-        // ── Create SVG ────────────────────────────────────────────────────────
+        // ── Wire up Labels toggle ─────────────────────────────────────────
+        labelsBtn.addEventListener('click', () => {
+            this.mmShowLabels = !this.mmShowLabels;
+            labelsBtn.classList.toggle('active', this.mmShowLabels);
+            wrapper.classList.toggle('archy-mm-labels-always', this.mmShowLabels);
+        });
+
+        // ── Create SVG ────────────────────────────────────────────────────
         const svg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
         svg.classList.add('archy-mindmap-svg');
         svg.setAttribute('width',   String(totalWidth));
@@ -441,7 +486,7 @@ export class ArchiTreeView extends ItemView {
         // Draw root + children subtree
         drawMmSubtree(edgeLayer, nodeLayer, mmRoot, null, this.app);
 
-        // ── Pan + zoom ────────────────────────────────────────────────────────
+        // ── Pan + zoom ────────────────────────────────────────────────────
         let panX = 0, panY = 0, zoom = 1;
         let dragging = false, lastX = 0, lastY = 0;
 
@@ -596,7 +641,7 @@ function drawMmNodeCircle(layer: SVGGElement, node: MmNode, app: App) {
     circle.setAttribute('class', circleCls);
     g.appendChild(circle);
 
-    // Hover label (shown via CSS on :hover)
+    // Label — hidden by default, shown on hover (or always when .archy-mm-labels-always)
     const label = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
     label.setAttribute('x', '0');
     label.setAttribute('y', String(MM_R + 14));

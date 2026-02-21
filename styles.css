@@ -48,6 +48,7 @@
 /* ── View-mode toggle ──────────────────────────────── */
 .archy-view-toggle {
 	display: flex;
+	align-items: center;
 	gap: 3px;
 	margin-right: 6px;
 }
@@ -70,6 +71,24 @@
 	background: var(--interactive-accent);
 	color: var(--text-on-accent);
 	border-color: var(--interactive-accent);
+}
+
+/* Separator between view-mode buttons and modifier buttons */
+.archy-toggle-sep {
+	width: 1px;
+	height: 14px;
+	background: var(--background-modifier-border);
+	margin: 0 3px;
+	flex-shrink: 0;
+}
+
+/* Modifier toggle buttons (Inherit, Labels) use a subtly different active tint
+   so they are visually distinct from the primary view-mode selection. */
+.archy-toggle-modifier.active {
+	background: var(--color-accent);
+	color: var(--text-on-accent);
+	border-color: var(--color-accent);
+	opacity: 0.85;
 }
 
 /* ── Legend ────────────────────────────────────────── */
@@ -267,6 +286,14 @@
    Mindmap SVG
 ═══════════════════════════════════════════════════════ */
 
+/* ── Mindmap control bar (Labels toggle, etc.) ─────── */
+.archy-mm-controls {
+	display: flex;
+	gap: 4px;
+	padding: 4px 8px 2px;
+	flex-shrink: 0;
+}
+
 /* ── Pan/zoom wrapper ──────────────────────────────── */
 .archy-mm-wrapper {
 	flex: 1;
@@ -331,6 +358,11 @@
 }
 
 .archy-mm-node:hover .archy-mm-label {
+	opacity: 1;
+}
+
+/* Always-visible labels when the Labels toggle is active */
+.archy-mm-labels-always .archy-mm-label {
 	opacity: 1;
 }
 

@@ -1,6 +1,8 @@
 # Archy – Knowledge Graph
 
-> An Obsidian plugin for connecting notes through explicit, typed relationships — and visualizing them as an interactive tree, mindmap, or force-directed network.
+An Obsidian plugin for connecting notes through explicit, typed relationships — and visualizing them as an interactive tree, mindmap, or force-directed network.
+
+![Archy Logo](assets/archylogo.png)
 
 ---
 
@@ -16,18 +18,18 @@ Archy gives you three relationship types to link your notes together:
 
 ### The Vinegar Example
 
-- `acetic_acid` is the parent concept (chemistry)
-- `vinegar` **dependson** `acetic_acid` and **leadsto** `vinaigrette`
-- `vinegar` is **informedby** `vinegaroon_defense` (vinegaroons spray acetic acid as a natural defense)
+- `electron` is the parent concept (chemistry)
+- `atom` **dependson** `electron` and **leadsto** `element`
+- `atom` is **informedby** `nuclear explosion` (splitting atoms in nuclear fission causes a nuclear explosion)
 
-The Folio tree rooted at `vinegar` looks like:
+The Folio tree rooted at `atom` looks like:
 
 ```
-  ↑ acetic_acid          ← ancestor (dependson parent, shown above)
+  ↑ electron          ← ancestor (dependson parent, shown above)
  ─────────────────────
-▾ vinegar                ← current note (root)
-  → vinaigrette          ← leadsto child
-  ◎ vinegaroon_defense   ← informedby child
+▾ atom                ← current note (root)
+  → element          ← leadsto child
+  ◎ nuclear_explosion   ← informedby child
 ```
 
 ---
@@ -262,4 +264,4 @@ After rebuilding, reload the plugin in Obsidian: **Settings → Community Plugin
 
 ## License
 
-MIT © 2026 Brandon
+MIT © 2026 Brandon Thomas Hendrickson
