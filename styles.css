@@ -45,12 +45,24 @@
 	color: var(--text-normal);
 }
 
+/* ── View header wrap (holds toggle row + settings dropdown) */
+.archy-view-header {
+	position: relative;
+	flex-shrink: 0;
+}
+
 /* ── View-mode toggle ──────────────────────────────── */
 .archy-view-toggle {
 	display: flex;
 	align-items: center;
 	gap: 3px;
-	margin-right: 6px;
+	padding: 4px 6px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* Spacer that pushes the gear button to the right */
+.archy-toggle-fill {
+	flex: 1;
 }
 
 .archy-toggle-btn {
@@ -67,28 +79,91 @@
 	background: var(--interactive-hover);
 	color: var(--text-normal);
 }
+/* Active view button: light grey, not the theme accent colour */
 .archy-toggle-btn.active {
-	background: var(--interactive-accent);
-	color: var(--text-on-accent);
-	border-color: var(--interactive-accent);
+	background: var(--background-secondary);
+	color: var(--text-normal);
+	border-color: var(--text-muted);
+	font-weight: 600;
 }
 
-/* Separator between view-mode buttons and modifier buttons */
-.archy-toggle-sep {
-	width: 1px;
-	height: 14px;
-	background: var(--background-modifier-border);
-	margin: 0 3px;
+/* Gear settings button */
+.archy-settings-btn {
+	font-size: 0.9em;
+	padding: 2px 6px;
+}
+
+/* ── Settings dropdown panel ────────────────────────── */
+.archy-settings-panel {
+	position: absolute;
+	top: 100%;
+	right: 0;
+	z-index: 200;
+	min-width: 220px;
+	max-height: 75vh;
+	overflow-y: auto;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+	padding: 6px 0 8px;
+}
+.archy-settings-panel.archy-settings-hidden {
+	display: none;
+}
+
+.archy-settings-group {
+	padding: 0 10px;
+	margin-bottom: 6px;
+}
+.archy-settings-group + .archy-settings-group {
+	border-top: 1px solid var(--background-modifier-border);
+	padding-top: 6px;
+}
+
+.archy-settings-group-title {
+	font-size: 0.72em;
+	font-weight: 700;
+	color: var(--text-muted);
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	margin-bottom: 4px;
+}
+
+.archy-settings-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 0;
+	font-size: 0.82em;
+	color: var(--text-normal);
+}
+.archy-settings-row.archy-settings-check {
+	cursor: default;
+}
+.archy-settings-row input[type="checkbox"] {
+	margin: 0;
+	cursor: pointer;
 	flex-shrink: 0;
 }
-
-/* Modifier toggle buttons (Inherit, Labels) use a subtly different active tint
-   so they are visually distinct from the primary view-mode selection. */
-.archy-toggle-modifier.active {
-	background: var(--color-accent);
-	color: var(--text-on-accent);
-	border-color: var(--color-accent);
-	opacity: 0.85;
+.archy-settings-label {
+	flex-shrink: 0;
+	min-width: 68px;
+	color: var(--text-muted);
+}
+.archy-settings-row input[type="range"] {
+	flex: 1;
+	min-width: 0;
+	accent-color: var(--interactive-accent);
+	cursor: pointer;
+}
+.archy-settings-val {
+	flex-shrink: 0;
+	min-width: 36px;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	color: var(--text-muted);
+	font-size: 0.9em;
 }
 
 /* ── Legend ────────────────────────────────────────── */
@@ -285,14 +360,6 @@
 /* ═══════════════════════════════════════════════════════
    Mindmap SVG
 ═══════════════════════════════════════════════════════ */
-
-/* ── Mindmap control bar (Labels toggle, etc.) ─────── */
-.archy-mm-controls {
-	display: flex;
-	gap: 4px;
-	padding: 4px 8px 2px;
-	flex-shrink: 0;
-}
 
 /* ── Pan/zoom wrapper ──────────────────────────────── */
 .archy-mm-wrapper {

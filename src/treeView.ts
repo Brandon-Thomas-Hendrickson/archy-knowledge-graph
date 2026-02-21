@@ -1,7 +1,7 @@
 import { ItemView, WorkspaceLeaf, App } from 'obsidian';
 import { NoteLinks, LinkType } from './types';
 import { buildFullGraph, openNote } from './parser';
-import { ForceGraphRenderer } from './forceGraph';
+import { ForceGraphRenderer, FGConfig, FGPanZoom } from './forceGraph';
 import type ArchiPlugin from './main';
 
 export const VIEW_TYPE_ARCHY = 'archy-tree';
@@ -15,47 +15,66 @@ interface TreeNode {
     children?: TreeNode[];
 }
 
-// ── SVG mindmap types & constants ─────────────────────────────────────────────
+// ── SVG mindmap types ─────────────────────────────────────────────────────────
 
 interface MmNode {
     name: string;
     linkType: LinkType | 'root' | 'parent';
-    x: number;   // circle centre x (filled during layout)
-    y: number;   // circle centre y (filled during layout)
+    x: number;
+    y: number;
     children: MmNode[];
 }
 
-const MM_R      = 14;   // circle radius
-const MM_SLOT   = 54;   // horizontal slot width per leaf
-const MM_H_GAP  = 20;   // gap between sibling slots
-const MM_V_GAP  = 80;   // vertical distance between level centres
-const MM_PAD    = 40;   // outer SVG padding
-const SVG_NS    = 'http://www.w3.org/2000/svg';
+// Fixed layout constants (not user-configurable)
+const MM_H_GAP = 20;
+const MM_V_GAP = 80;
+const MM_PAD   = 40;
+const SVG_NS   = 'http://www.w3.org/2000/svg';
 
 export class ArchiTreeView extends ItemView {
     plugin: ArchiPlugin;
     private graph: Map<string, NoteLinks> = new Map();
     private rootName: string | null = null;
-    private treeContainerEl: HTMLElement | null = null;
+    private treeContainerEl:  HTMLElement | null = null;
+    private settingsPanelEl:  HTMLElement | null = null;
+    private forceRenderer:    ForceGraphRenderer | null = null;
+    private mmWrapperEl:      HTMLElement | null = null;  // live CSS reference
+
     private currentMode: 'folio' | 'mindmap' | 'network';
-    private forceRenderer: ForceGraphRenderer | null = null;
 
-    // Mindmap: whether labels are always visible (vs hover-only)
-    private mmShowLabels = false;
-
-    // Whether to apply transitive reduction (inheritance collapse)
+    // ── Graph modifier ────────────────────────────────────────────────────────
     private applyInheritance = false;
 
-    // toggle button references
-    private folioBtn:     HTMLButtonElement | null = null;
-    private mindmapBtn:   HTMLButtonElement | null = null;
-    private networkBtn:   HTMLButtonElement | null = null;
-    private inheritBtn:   HTMLButtonElement | null = null;
+    // ── Mindmap display settings ───────────────────────────────────────────────
+    private mmShowLabels = false;
+    private mmR          = 14;    // node radius
+    private mmEdgeW      = 1.5;   // edge stroke width
+
+    // Mindmap pan/zoom — persisted across graph rebuilds
+    private mmPanX = 0;
+    private mmPanY = 0;
+    private mmZoom = 1;
+
+    // ── Force-graph display / physics settings ────────────────────────────────
+    private fgEdgeW     = 1.2;
+    private fgNodeBaseR = 7;
+    private fgRepulsion = 5500;
+    private fgSpringK   = 0.03;
+    private fgRestLen   = 120;
+    private fgGravity   = 0.03;
+
+    // Force-graph pan/zoom — saved before rebuild, restored after
+    private fgPanSaved: FGPanZoom | null = null;
+
+    // ── Header button refs ────────────────────────────────────────────────────
+    private folioBtn:    HTMLButtonElement | null = null;
+    private mindmapBtn:  HTMLButtonElement | null = null;
+    private networkBtn:  HTMLButtonElement | null = null;
+    private settingsBtn: HTMLButtonElement | null = null;
 
     constructor(leaf: WorkspaceLeaf, plugin: ArchiPlugin) {
         super(leaf);
         this.plugin = plugin;
-        // 'vault' was removed; fall back to 'network' if an old setting persists
         const saved = plugin.settings.viewMode as string;
         this.currentMode = (saved === 'vault' ? 'network' : saved) as 'folio' | 'mindmap' | 'network';
     }
@@ -69,79 +88,219 @@ export class ArchiTreeView extends ItemView {
         contentEl.empty();
         contentEl.addClass('archy-view');
 
-        // ── View-mode toggle bar ───────────────────────────────────────────
-        const toggle = contentEl.createDiv({ cls: 'archy-view-toggle' });
+        // ── Header: view-mode buttons + settings gear ─────────────────────────
+        const headerWrap = contentEl.createDiv({ cls: 'archy-view-header' });
+
+        const toggle = headerWrap.createDiv({ cls: 'archy-view-toggle' });
         this.folioBtn   = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'Folio' });
-        this.mindmapBtn = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'Mindmap' });
+        this.mindmapBtn = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'MindMap' });
         this.networkBtn = toggle.createEl('button', { cls: 'archy-toggle-btn', text: 'Network' });
 
-        // Separator between view-mode buttons and modifier buttons
-        toggle.createSpan({ cls: 'archy-toggle-sep' });
+        toggle.createSpan({ cls: 'archy-toggle-fill' });   // pushes gear to right
 
-        // Inherit toggle: collapse transitive connections
-        this.inheritBtn = toggle.createEl('button', {
-            cls: 'archy-toggle-btn archy-toggle-modifier',
-            text: 'Inherit',
+        this.settingsBtn = toggle.createEl('button', {
+            cls: 'archy-toggle-btn archy-settings-btn',
+            text: '⚙',
         });
-        this.inheritBtn.title =
-            'Collapse redundant connections that are implied by a longer path (transitive reduction)';
+        this.settingsBtn.title = 'Display & physics settings';
 
         this.updateToggleBtns();
 
         this.folioBtn.addEventListener('click', () => {
             this.currentMode = 'folio';
+            this.mmPanX = 0; this.mmPanY = 0; this.mmZoom = 1;
+            this.fgPanSaved = null;
             this.updateToggleBtns();
             this.refresh();
         });
         this.mindmapBtn.addEventListener('click', () => {
             this.currentMode = 'mindmap';
+            this.mmPanX = 0; this.mmPanY = 0; this.mmZoom = 1;
             this.updateToggleBtns();
             this.refresh();
         });
         this.networkBtn.addEventListener('click', () => {
             this.currentMode = 'network';
+            this.fgPanSaved = null;
             this.updateToggleBtns();
             this.refresh();
         });
-        this.inheritBtn.addEventListener('click', () => {
-            this.applyInheritance = !this.applyInheritance;
-            this.updateToggleBtns();
-            this.refresh();
+        this.settingsBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleSettingsPanel();
         });
 
-        // ── Tree / graph container ───────────────────────────────────────
+        // ── Settings dropdown panel ───────────────────────────────────────────
+        this.settingsPanelEl = headerWrap.createDiv({ cls: 'archy-settings-panel archy-settings-hidden' });
+        this.buildSettingsPanel(this.settingsPanelEl);
+
+        // ── Tree / graph container ────────────────────────────────────────────
         this.treeContainerEl = contentEl.createDiv({ cls: 'archy-tree-container' });
 
         await this.refresh();
     }
 
+    // ── Settings panel ────────────────────────────────────────────────────────
+
+    private toggleSettingsPanel() {
+        if (!this.settingsPanelEl) return;
+        const hidden = this.settingsPanelEl.classList.toggle('archy-settings-hidden');
+        if (!hidden) {
+            // Close when clicking anywhere outside the panel
+            const close = (e: MouseEvent) => {
+                if (
+                    this.settingsPanelEl &&
+                    !this.settingsPanelEl.contains(e.target as Node) &&
+                    e.target !== this.settingsBtn
+                ) {
+                    this.settingsPanelEl.classList.add('archy-settings-hidden');
+                    document.removeEventListener('click', close, true);
+                }
+            };
+            setTimeout(() => document.addEventListener('click', close, true), 50);
+        }
+    }
+
+    private buildSettingsPanel(panel: HTMLElement) {
+        // ── Graph ─────────────────────────────────────────────────────────────
+        this.addSettingsGroup(panel, 'Graph', (grp) => {
+            this.addCheckRow(grp, 'Inherit',
+                'Collapse connections already implied by a longer path (transitive reduction)',
+                () => this.applyInheritance,
+                (v) => { this.applyInheritance = v; this.refresh(true); });
+        });
+
+        // ── Mindmap ───────────────────────────────────────────────────────────
+        this.addSettingsGroup(panel, 'Mindmap', (grp) => {
+            this.addCheckRow(grp, 'Labels',
+                'Always show node names (default: hover to reveal)',
+                () => this.mmShowLabels,
+                (v) => { this.mmShowLabels = v; this.applyMmLabels(); });
+            this.addSliderRow(grp, 'Node size',  6, 28, 1,   this.mmR,
+                (v) => { this.mmR    = v; this.refresh(true); });
+            this.addSliderRow(grp, 'Edge width', 0.5, 5, 0.5, this.mmEdgeW,
+                (v) => { this.mmEdgeW = v; this.refresh(true); });
+        });
+
+        // ── Network ───────────────────────────────────────────────────────────
+        this.addSettingsGroup(panel, 'Network', (grp) => {
+            this.addSliderRow(grp, 'Node size',   3, 18, 1,      this.fgNodeBaseR,
+                (v) => { this.fgNodeBaseR = v; this.refresh(true); });
+            this.addSliderRow(grp, 'Edge width',  0.5, 5, 0.5,   this.fgEdgeW,
+                (v) => { this.fgEdgeW  = v; this.refresh(true); });
+            this.addSliderRow(grp, 'Repulsion',   500, 15000, 500, this.fgRepulsion,
+                (v) => { this.fgRepulsion = v; this.refresh(true); });
+            this.addSliderRow(grp, 'Spring',      0.005, 0.15, 0.005, this.fgSpringK,
+                (v) => { this.fgSpringK = v; this.refresh(true); });
+            this.addSliderRow(grp, 'Rest length', 40, 400, 10,   this.fgRestLen,
+                (v) => { this.fgRestLen = v; this.refresh(true); });
+            this.addSliderRow(grp, 'Gravity',     0.005, 0.1, 0.005, this.fgGravity,
+                (v) => { this.fgGravity = v; this.refresh(true); });
+        });
+    }
+
+    private addSettingsGroup(panel: HTMLElement, title: string, cb: (g: HTMLElement) => void) {
+        const grp = panel.createDiv({ cls: 'archy-settings-group' });
+        grp.createDiv({ cls: 'archy-settings-group-title', text: title });
+        cb(grp);
+    }
+
+    private addCheckRow(
+        parent: HTMLElement, label: string, hint: string,
+        get: () => boolean, set: (v: boolean) => void
+    ) {
+        const row = parent.createDiv({ cls: 'archy-settings-row archy-settings-check' });
+        row.title = hint;
+        const cb = row.createEl('input');
+        cb.type    = 'checkbox';
+        cb.checked = get();
+        row.createSpan({ text: label });
+        cb.addEventListener('change', () => set(cb.checked));
+    }
+
+    private addSliderRow(
+        parent: HTMLElement, label: string,
+        min: number, max: number, step: number, initValue: number,
+        set: (v: number) => void
+    ) {
+        const row = parent.createDiv({ cls: 'archy-settings-row' });
+        row.createSpan({ cls: 'archy-settings-label', text: label });
+        const slider = row.createEl('input');
+        slider.type  = 'range';
+        slider.min   = String(min);
+        slider.max   = String(max);
+        slider.step  = String(step);
+        slider.value = String(initValue);
+        const valSpan = row.createSpan({ cls: 'archy-settings-val', text: fmtVal(initValue, step) });
+        slider.addEventListener('input', () => {
+            const v = parseFloat(slider.value);
+            valSpan.textContent = fmtVal(v, step);
+            set(v);
+        });
+    }
+
+    // Apply the Labels toggle live (no full rebuild needed)
+    private applyMmLabels() {
+        this.mmWrapperEl?.classList.toggle('archy-mm-labels-always', this.mmShowLabels);
+    }
+
+    // ── Toggle button state ───────────────────────────────────────────────────
+
     private updateToggleBtns() {
         this.folioBtn?.classList.toggle(  'active', this.currentMode === 'folio');
         this.mindmapBtn?.classList.toggle('active', this.currentMode === 'mindmap');
         this.networkBtn?.classList.toggle('active', this.currentMode === 'network');
-        this.inheritBtn?.classList.toggle('active', this.applyInheritance);
     }
 
-    async refresh() {
+    // ── Refresh ───────────────────────────────────────────────────────────────
+
+    /**
+     * Rebuild the view.
+     * @param preservePanZoom When true, the current pan/zoom state is saved
+     *   before the rebuild and restored afterward, so settings changes do not
+     *   reset the user's viewport.  When false (default, e.g. note change),
+     *   pan/zoom resets to its default for the current view.
+     */
+    async refresh(preservePanZoom = false) {
         if (!this.treeContainerEl) return;
 
-        // Stop any running force-graph animation before rebuilding
+        // Save network pan/zoom before stopping the renderer
+        if (preservePanZoom && this.forceRenderer) {
+            this.fgPanSaved = this.forceRenderer.getPanZoom();
+        } else if (!preservePanZoom) {
+            // Full reset — clear saved pan/zoom for both views
+            this.mmPanX = 0; this.mmPanY = 0; this.mmZoom = 1;
+            this.fgPanSaved = null;
+        }
+
         this.forceRenderer?.stop();
         this.forceRenderer = null;
 
         this.treeContainerEl.empty();
         this.treeContainerEl.style.fontSize = `${this.plugin.settings.folioFontSize}px`;
 
-        // ── Network: full-vault force graph ───────────────────────────────
+        // ── Network ───────────────────────────────────────────────────────────
         if (this.currentMode === 'network') {
             const rawGraph = await buildFullGraph(this.app, false, this.applyInheritance);
             const rootName = this.app.workspace.getActiveFile()?.basename ?? null;
-            this.forceRenderer = new ForceGraphRenderer(this.app, rootName);
-            this.forceRenderer.mount(this.treeContainerEl, rawGraph);
+            const cfg: FGConfig = {
+                edgeWidth:   this.fgEdgeW,
+                nodeBaseR:   this.fgNodeBaseR,
+                repulsion:   this.fgRepulsion,
+                springK:     this.fgSpringK,
+                restLen:     this.fgRestLen,
+                gravity:     this.fgGravity,
+            };
+            this.forceRenderer = new ForceGraphRenderer(this.app, rootName, cfg);
+            this.forceRenderer.mount(
+                this.treeContainerEl,
+                rawGraph,
+                preservePanZoom ? (this.fgPanSaved ?? undefined) : undefined,
+            );
             return;
         }
 
-        // ── Folio / Mindmap: active-note tree ─────────────────────────────
+        // ── Folio / Mindmap ───────────────────────────────────────────────────
         this.graph = await buildFullGraph(this.app, true, this.applyInheritance);
 
         const activeFile = this.app.workspace.getActiveFile();
@@ -155,7 +314,6 @@ export class ArchiTreeView extends ItemView {
             return;
         }
 
-        // Build inverted informedby index: for each note B, which notes A have informedby@B
         const informedbyOf = new Map<string, string[]>();
         for (const [noteName, links] of this.graph) {
             for (const ib of links.informedby) {
@@ -165,7 +323,9 @@ export class ArchiTreeView extends ItemView {
         }
 
         const rootNode    = this.buildTreeNode(this.rootName, 'root', 0, new Set());
-        const parentNodes = this.buildParentNodes(this.rootName, this.plugin.settings.parentDepth, new Set([this.rootName]), informedbyOf);
+        const parentNodes = this.buildParentNodes(
+            this.rootName, this.plugin.settings.parentDepth, new Set([this.rootName]), informedbyOf
+        );
 
         if (this.currentMode === 'mindmap') {
             this.renderMindmap(this.treeContainerEl, rootNode, parentNodes);
@@ -174,106 +334,59 @@ export class ArchiTreeView extends ItemView {
         }
     }
 
-    // ── Folio render ──────────────────────────────────────────────────────────
+    // ── Folio ─────────────────────────────────────────────────────────────────
 
     private renderFolio(container: HTMLElement, rootNode: TreeNode, parentNodes: TreeNode[]) {
-        // Render parent ancestors above the root
         if (parentNodes.length > 0) {
             const parentSection = container.createDiv({ cls: 'archy-parent-section' });
-            for (const p of parentNodes) {
-                this.renderParentNode(parentSection, p, 0);
-            }
+            for (const p of parentNodes) this.renderParentNode(parentSection, p, 0);
             container.createEl('hr', { cls: 'archy-parent-divider' });
         }
-
-        // Render current note root + children (existing behaviour)
         this.renderNode(container, rootNode);
     }
 
-    // ── Downward tree builder ─────────────────────────────────────────────────
+    // ── Tree builders ─────────────────────────────────────────────────────────
 
     private buildTreeNode(
-        name: string,
-        linkType: LinkType | 'root',
-        depth: number,
-        visited: Set<string>
+        name: string, linkType: LinkType | 'root', depth: number, visited: Set<string>
     ): TreeNode {
         const node: TreeNode = { name, linkType, depth, expanded: true };
-
         const maxDepth = this.plugin.settings.maxDepth;
-        if (depth >= maxDepth || visited.has(name)) {
-            node.children = [];
-            return node;
-        }
-
+        if (depth >= maxDepth || visited.has(name)) { node.children = []; return node; }
         const seen = new Set(visited);
         seen.add(name);
-
         const links = this.graph.get(name);
-        if (!links) {
-            node.children = [];
-            return node;
-        }
-
-        // dependson = parents, shown above root — never listed as children
+        if (!links) { node.children = []; return node; }
         node.children = [
-            ...links.leadsto.map(n => this.buildTreeNode(n, 'leadsto', depth + 1, seen)),
+            ...links.leadsto.map(n   => this.buildTreeNode(n, 'leadsto',   depth + 1, seen)),
             ...links.informedby.map(n => this.buildTreeNode(n, 'informedby', depth + 1, seen)),
         ];
-
         return node;
     }
 
-    // ── Upward parent builder ─────────────────────────────────────────────────
-
-    /**
-     * Build ancestor nodes above the current root.
-     * Includes two kinds of parents:
-     *   - Hierarchical parents: notes in note.dependson (via bidirectional inference)
-     *   - Context parents: notes that have informedby@note (inverted informedby index)
-     */
     private buildParentNodes(
-        name: string,
-        depth: number,
-        visited: Set<string>,
+        name: string, depth: number, visited: Set<string>,
         informedbyOf: Map<string, string[]>
     ): TreeNode[] {
         if (depth <= 0) return [];
         const links = this.graph.get(name);
-
         const hierarchicalParents = links?.dependson ?? [];
         const contextParents      = informedbyOf.get(name) ?? [];
-
         if (hierarchicalParents.length === 0 && contextParents.length === 0) return [];
 
         const parents: TreeNode[] = [];
-
         for (const parentName of hierarchicalParents) {
             if (visited.has(parentName)) continue;
-            const seen = new Set(visited);
-            seen.add(parentName);
-            parents.push({
-                name: parentName,
-                linkType: 'parent',
-                depth: 0,
-                expanded: true,
-                children: this.buildParentNodes(parentName, depth - 1, seen, informedbyOf),
-            });
+            const seen = new Set(visited); seen.add(parentName);
+            parents.push({ name: parentName, linkType: 'parent', depth: 0, expanded: true,
+                children: this.buildParentNodes(parentName, depth - 1, seen, informedbyOf) });
         }
-
         for (const contextName of contextParents) {
             if (visited.has(contextName)) continue;
-            const seen = new Set(visited);
-            seen.add(contextName);
-            parents.push({
-                name: contextName,
-                linkType: 'informedby',   // use ◎ amber — this note informed the current note
-                depth: 0,
-                expanded: true,
-                children: this.buildParentNodes(contextName, depth - 1, seen, informedbyOf),
-            });
+            const seen = new Set(visited); seen.add(contextName);
+            parents.push({ name: contextName, linkType: 'informedby', depth: 0, expanded: true,
+                children: this.buildParentNodes(contextName, depth - 1, seen, informedbyOf) });
         }
-
         return parents;
     }
 
@@ -281,31 +394,19 @@ export class ArchiTreeView extends ItemView {
 
     private renderNode(parent: HTMLElement, node: TreeNode) {
         const wrapper = parent.createDiv({ cls: 'archy-node-wrapper' });
-        const row = wrapper.createDiv({ cls: 'archy-node-row' });
-
-        // Indentation
+        const row     = wrapper.createDiv({ cls: 'archy-node-row' });
         if (node.depth > 0) {
             const indent = row.createDiv({ cls: 'archy-indent' });
             indent.style.width = `${(node.depth - 1) * 18}px`;
         }
-
-        // Toggle button
         const hasChildren = node.children && node.children.length > 0;
         const toggle = row.createSpan({ cls: 'archy-toggle' });
-        if (hasChildren) {
-            toggle.setText(node.expanded ? '▾' : '▸');
-        } else {
-            toggle.setText('·');
-            toggle.style.opacity = '0.3';
-        }
+        toggle.setText(hasChildren ? (node.expanded ? '▾' : '▸') : '·');
+        if (!hasChildren) toggle.style.opacity = '0.3';
 
-        // Link type icon
         if (node.linkType !== 'root') {
             const icons: Record<string, string> = {
-                leadsto:   '→',
-                dependson: '↑',
-                informedby:'◎',
-                parent:    '↑',
+                leadsto: '→', dependson: '↑', informedby: '◎', parent: '↑',
             };
             row.createSpan({
                 cls: `archy-icon archy-link-${node.linkType === 'parent' ? 'dependson' : node.linkType}`,
@@ -313,7 +414,6 @@ export class ArchiTreeView extends ItemView {
             });
         }
 
-        // Note name (clickable)
         const nameEl = row.createSpan({
             cls: node.linkType === 'root' ? 'archy-node-name archy-root-name' : 'archy-node-name',
             text: node.name,
@@ -321,7 +421,6 @@ export class ArchiTreeView extends ItemView {
         nameEl.title = `Open: ${node.name}`;
         nameEl.addEventListener('click', () => openNote(node.name, this.app));
 
-        // Children container
         const childContainer = wrapper.createDiv({ cls: 'archy-children' });
         if (!node.expanded) childContainer.addClass('archy-hidden');
 
@@ -332,40 +431,23 @@ export class ArchiTreeView extends ItemView {
                 toggle.setText(node.expanded ? '▾' : '▸');
                 childContainer.toggleClass('archy-hidden', !node.expanded);
             });
-
-            for (const child of node.children!) {
-                this.renderNode(childContainer, child);
-            }
+            for (const child of node.children!) this.renderNode(childContainer, child);
         }
     }
 
-    /**
-     * Render a parent/ancestor node (displayed above the root divider).
-     * parentLevel=0 means direct parent, 1 means grandparent, etc.
-     * Deeper ancestors are shown at greater indentation (indent = level * 18px).
-     */
     private renderParentNode(parent: HTMLElement, node: TreeNode, level: number) {
         const wrapper = parent.createDiv({ cls: 'archy-node-wrapper' });
-        const row = wrapper.createDiv({ cls: 'archy-node-row' });
-
-        // Indent deeper ancestors more
+        const row     = wrapper.createDiv({ cls: 'archy-node-row' });
         if (level > 0) {
             const indent = row.createDiv({ cls: 'archy-indent' });
             indent.style.width = `${level * 18}px`;
         }
-
-        // Toggle
         const hasChildren = node.children && node.children.length > 0;
         const toggle = row.createSpan({ cls: 'archy-toggle' });
-        if (hasChildren) {
-            toggle.setText(node.expanded ? '▾' : '▸');
-        } else {
-            toggle.setText('·');
-            toggle.style.opacity = '0.3';
-        }
+        toggle.setText(hasChildren ? (node.expanded ? '▾' : '▸') : '·');
+        if (!hasChildren) toggle.style.opacity = '0.3';
 
-        // Icon: ↑ blue for hierarchical parents, ◎ amber for informedby-context parents
-        const parentIcon = node.linkType === 'informedby' ? '◎' : '↑';
+        const parentIcon    = node.linkType === 'informedby' ? '◎' : '↑';
         const parentIconCls = node.linkType === 'informedby' ? 'archy-link-informedby' : 'archy-link-dependson';
         row.createSpan({ cls: `archy-icon ${parentIconCls}`, text: parentIcon });
 
@@ -383,87 +465,62 @@ export class ArchiTreeView extends ItemView {
                 toggle.setText(node.expanded ? '▾' : '▸');
                 childContainer.toggleClass('archy-hidden', !node.expanded);
             });
-            for (const child of node.children!) {
-                this.renderParentNode(childContainer, child, level + 1);
-            }
+            for (const child of node.children!) this.renderParentNode(childContainer, child, level + 1);
         }
     }
 
-    // ── Mindmap SVG renderer ──────────────────────────────────────────────────
+    // ── Mindmap ───────────────────────────────────────────────────────────────
 
     private renderMindmap(container: HTMLElement, rootNode: TreeNode, parentNodes: TreeNode[]) {
-        // ── Labels control bar ────────────────────────────────────────────
-        const mmControls = document.createElement('div');
-        mmControls.className = 'archy-mm-controls';
+        const r      = this.mmR;
+        const edgeW  = this.mmEdgeW;
+        const mmSlot = Math.max(54, r * 4);
 
-        const labelsBtn = document.createElement('button');
-        labelsBtn.className = 'archy-toggle-btn archy-toggle-modifier'
-            + (this.mmShowLabels ? ' active' : '');
-        labelsBtn.textContent = 'Labels';
-        labelsBtn.title = 'Always show node names (default: hover to reveal)';
-        mmControls.appendChild(labelsBtn);
-        container.appendChild(mmControls);
+        const mmRoot    = toMmNode(rootNode);
+        const mmParents = parentNodes.map(p => toMmNode(p));
 
-        // ── Build MmNode trees ────────────────────────────────────────────
-        const mmRoot     = toMmNode(rootNode);
-        const mmParents  = parentNodes.map(p => toMmNode(p));
-
-        // ── Compute required band widths ──────────────────────────────────
-        const childBand   = slotW(mmRoot);
-        const parentBand  = mmParents.length > 0
-            ? mmParents.reduce((acc, p) => acc + slotW(p), 0) + (mmParents.length - 1) * MM_H_GAP
+        const childBand  = slotW(mmRoot, mmSlot);
+        const parentBand = mmParents.length > 0
+            ? mmParents.reduce((acc, p) => acc + slotW(p, mmSlot), 0) + (mmParents.length - 1) * MM_H_GAP
             : 0;
-        const innerW      = Math.max(childBand, parentBand, MM_SLOT);
-        const totalWidth  = innerW + MM_PAD * 2;
+        const innerW     = Math.max(childBand, parentBand, mmSlot);
+        const totalWidth = innerW + MM_PAD * 2;
 
-        // ── Place root ────────────────────────────────────────────────────
-        const rootCX  = totalWidth / 2;
-        const rootY   = MM_PAD + (mmParents.length > 0 ? MM_V_GAP : 0);
+        const rootCX = totalWidth / 2;
+        const rootY  = MM_PAD + (mmParents.length > 0 ? MM_V_GAP : 0);
 
         mmRoot.x = rootCX;
         mmRoot.y = rootY;
 
-        // ── Layout children downward ──────────────────────────────────────
-        layoutDown(mmRoot.children, rootCX, rootY + MM_V_GAP);
+        layoutDown(mmRoot.children, rootCX, rootY + MM_V_GAP, mmSlot);
 
-        // ── Layout parents upward ─────────────────────────────────────────
         if (mmParents.length > 0) {
             let startX = totalWidth / 2 - parentBand / 2;
             for (const mp of mmParents) {
-                const sw = slotW(mp);
+                const sw = slotW(mp, mmSlot);
                 mp.x = startX + sw / 2;
                 mp.y = rootY - MM_V_GAP;
-                // grandparent ancestors above the parent
-                layoutUp(mp.children, mp.x, mp.y - MM_V_GAP);
+                layoutUp(mp.children, mp.x, mp.y - MM_V_GAP, mmSlot);
                 startX += sw + MM_H_GAP;
             }
         }
 
-        // ── Compute SVG height ────────────────────────────────────────────
-        let maxY = rootY;
-        walkMm(mmRoot,    n => { if (n.y > maxY) maxY = n.y; });
-        for (const mp of mmParents) walkMm(mp, n => { if (n.y > maxY) maxY = n.y; });
-        let minY = rootY;
-        walkMm(mmRoot,    n => { if (n.y < minY) minY = n.y; });
-        for (const mp of mmParents) walkMm(mp, n => { if (n.y < minY) minY = n.y; });
+        let maxY = rootY, minY = rootY;
+        walkMm(mmRoot, n => { if (n.y > maxY) maxY = n.y; if (n.y < minY) minY = n.y; });
+        for (const mp of mmParents) {
+            walkMm(mp, n => { if (n.y > maxY) maxY = n.y; if (n.y < minY) minY = n.y; });
+        }
 
-        const svgHeight = (maxY - minY) + MM_R * 2 + MM_PAD * 2 + 24; // 24 for label text
-        const offsetY   = minY - MM_PAD - MM_R;   // shift everything so top = 0
+        const svgHeight = (maxY - minY) + r * 2 + MM_PAD * 2 + 24;
+        const offsetY   = minY - MM_PAD - r;
 
-        // ── Create pan/zoom wrapper ───────────────────────────────────────
+        // Pan/zoom wrapper
         const wrapper = document.createElement('div');
-        wrapper.className = 'archy-mm-wrapper'
-            + (this.mmShowLabels ? ' archy-mm-labels-always' : '');
+        wrapper.className = 'archy-mm-wrapper' + (this.mmShowLabels ? ' archy-mm-labels-always' : '');
         container.appendChild(wrapper);
+        this.mmWrapperEl = wrapper;
 
-        // ── Wire up Labels toggle ─────────────────────────────────────────
-        labelsBtn.addEventListener('click', () => {
-            this.mmShowLabels = !this.mmShowLabels;
-            labelsBtn.classList.toggle('active', this.mmShowLabels);
-            wrapper.classList.toggle('archy-mm-labels-always', this.mmShowLabels);
-        });
-
-        // ── Create SVG ────────────────────────────────────────────────────
+        // SVG
         const svg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
         svg.classList.add('archy-mindmap-svg');
         svg.setAttribute('width',   String(totalWidth));
@@ -471,64 +528,57 @@ export class ArchiTreeView extends ItemView {
         svg.setAttribute('viewBox', `0 ${offsetY} ${totalWidth} ${svgHeight}`);
         wrapper.appendChild(svg);
 
-        // Edges drawn first (behind nodes)
         const edgeLayer = document.createElementNS(SVG_NS, 'g') as SVGGElement;
         svg.appendChild(edgeLayer);
         const nodeLayer = document.createElementNS(SVG_NS, 'g') as SVGGElement;
         svg.appendChild(nodeLayer);
 
-        // Draw parent nodes + edges to root
         for (const mp of mmParents) {
-            drawMmSubtree(edgeLayer, nodeLayer, mp, null, this.app);
-            drawMmEdge(edgeLayer, mp, mmRoot, 'parent');
+            drawMmSubtree(edgeLayer, nodeLayer, mp, null, this.app, r, edgeW);
+            drawMmEdge(edgeLayer, mp, mmRoot, 'parent', r, edgeW);
         }
+        drawMmSubtree(edgeLayer, nodeLayer, mmRoot, null, this.app, r, edgeW);
 
-        // Draw root + children subtree
-        drawMmSubtree(edgeLayer, nodeLayer, mmRoot, null, this.app);
-
-        // ── Pan + zoom ────────────────────────────────────────────────────
-        let panX = 0, panY = 0, zoom = 1;
+        // Pan + zoom — use stored state so rebuilds preserve position
+        let panX = this.mmPanX, panY = this.mmPanY, zoom = this.mmZoom;
         let dragging = false, lastX = 0, lastY = 0;
 
         const applyTransform = () => {
             svg.style.transformOrigin = '0 0';
             svg.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+            // Keep class fields in sync so the next rebuild can restore them
+            this.mmPanX = panX; this.mmPanY = panY; this.mmZoom = zoom;
         };
+
+        applyTransform();  // apply immediately (no flash at default 0,0,1)
 
         const onMouseMove = (e: MouseEvent) => {
             if (!dragging) return;
-            panX += e.clientX - lastX;
-            panY += e.clientY - lastY;
-            lastX = e.clientX;
-            lastY = e.clientY;
+            panX += e.clientX - lastX; panY += e.clientY - lastY;
+            lastX = e.clientX; lastY = e.clientY;
             applyTransform();
         };
-
         const onMouseUp = () => {
             dragging = false;
             wrapper.classList.remove('archy-mm-dragging');
             document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onMouseUp);
+            document.removeEventListener('mouseup',   onMouseUp);
         };
 
         wrapper.addEventListener('mousedown', (e: MouseEvent) => {
             if (e.button !== 0) return;
-            dragging = true;
-            lastX = e.clientX;
-            lastY = e.clientY;
+            dragging = true; lastX = e.clientX; lastY = e.clientY;
             wrapper.classList.add('archy-mm-dragging');
             e.preventDefault();
             document.addEventListener('mousemove', onMouseMove);
-            document.addEventListener('mouseup', onMouseUp);
+            document.addEventListener('mouseup',   onMouseUp);
         });
 
         wrapper.addEventListener('wheel', (e: WheelEvent) => {
             e.preventDefault();
             const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
             const rect   = wrapper.getBoundingClientRect();
-            const mx     = e.clientX - rect.left;
-            const my     = e.clientY - rect.top;
-            // Keep the point under the cursor fixed in content space
+            const mx = e.clientX - rect.left, my = e.clientY - rect.top;
             panX = mx - (mx - panX) * factor;
             panY = my - (my - panY) * factor;
             zoom *= factor;
@@ -537,9 +587,7 @@ export class ArchiTreeView extends ItemView {
     }
 
     /** Called by main plugin when metadata changes */
-    async onMetadataChange() {
-        await this.refresh();
-    }
+    async onMetadataChange() { await this.refresh(); }
 
     async onClose() {
         this.forceRenderer?.stop();
@@ -547,52 +595,42 @@ export class ArchiTreeView extends ItemView {
     }
 }
 
-// ── Mindmap pure helpers (module-level) ───────────────────────────────────────
+// ── Module-level mindmap helpers ──────────────────────────────────────────────
 
 function toMmNode(t: TreeNode): MmNode {
-    return {
-        name: t.name,
-        linkType: t.linkType,
-        x: 0,
-        y: 0,
-        children: (t.children ?? []).map(c => toMmNode(c)),
-    };
+    return { name: t.name, linkType: t.linkType, x: 0, y: 0,
+             children: (t.children ?? []).map(c => toMmNode(c)) };
 }
 
-/** Total horizontal slot required to lay out this node + all descendants. */
-function slotW(node: MmNode): number {
-    if (node.children.length === 0) return MM_SLOT;
-    const childrenTotal = node.children.reduce((acc, c) => acc + slotW(c), 0)
+function slotW(node: MmNode, mmSlot: number): number {
+    if (node.children.length === 0) return mmSlot;
+    const childrenTotal = node.children.reduce((acc, c) => acc + slotW(c, mmSlot), 0)
         + (node.children.length - 1) * MM_H_GAP;
-    return Math.max(MM_SLOT, childrenTotal);
+    return Math.max(mmSlot, childrenTotal);
 }
 
-/** Layout children going downward, centred under parentCX. */
-function layoutDown(children: MmNode[], parentCX: number, y: number) {
+function layoutDown(children: MmNode[], parentCX: number, y: number, mmSlot: number) {
     if (children.length === 0) return;
-    const bandW = children.reduce((acc, c) => acc + slotW(c), 0)
+    const bandW = children.reduce((acc, c) => acc + slotW(c, mmSlot), 0)
         + (children.length - 1) * MM_H_GAP;
     let x = parentCX - bandW / 2;
     for (const c of children) {
-        const sw = slotW(c);
-        c.x = x + sw / 2;
-        c.y = y;
-        layoutDown(c.children, c.x, y + MM_V_GAP);
+        const sw = slotW(c, mmSlot);
+        c.x = x + sw / 2; c.y = y;
+        layoutDown(c.children, c.x, y + MM_V_GAP, mmSlot);
         x += sw + MM_H_GAP;
     }
 }
 
-/** Layout children going upward (for grandparent ancestors), centred under parentCX. */
-function layoutUp(children: MmNode[], parentCX: number, y: number) {
+function layoutUp(children: MmNode[], parentCX: number, y: number, mmSlot: number) {
     if (children.length === 0) return;
-    const bandW = children.reduce((acc, c) => acc + slotW(c), 0)
+    const bandW = children.reduce((acc, c) => acc + slotW(c, mmSlot), 0)
         + (children.length - 1) * MM_H_GAP;
     let x = parentCX - bandW / 2;
     for (const c of children) {
-        const sw = slotW(c);
-        c.x = x + sw / 2;
-        c.y = y;
-        layoutUp(c.children, c.x, y - MM_V_GAP);
+        const sw = slotW(c, mmSlot);
+        c.x = x + sw / 2; c.y = y;
+        layoutUp(c.children, c.x, y - MM_V_GAP, mmSlot);
         x += sw + MM_H_GAP;
     }
 }
@@ -602,30 +640,29 @@ function walkMm(node: MmNode, cb: (n: MmNode) => void) {
     for (const c of node.children) walkMm(c, cb);
 }
 
-function drawMmEdge(layer: SVGGElement, from: MmNode, to: MmNode, linkType: LinkType | 'parent' | 'root') {
+function drawMmEdge(
+    layer: SVGGElement, from: MmNode, to: MmNode,
+    linkType: LinkType | 'parent' | 'root', r: number, edgeW: number
+) {
     const cls = linkType === 'parent' || linkType === 'dependson' ? 'archy-mm-edge-dependson'
               : linkType === 'informedby' ? 'archy-mm-edge-informedby'
               : 'archy-mm-edge-leadsto';
 
-    // Connect edge to the circumference of each circle (top/bottom depending on direction)
     const goingDown = from.y < to.y;
-    const x1 = from.x;
-    const y1 = goingDown ? from.y + MM_R : from.y - MM_R;
-    const x2 = to.x;
-    const y2 = goingDown ? to.y - MM_R : to.y + MM_R;
+    const x1 = from.x, y1 = goingDown ? from.y + r : from.y - r;
+    const x2 = to.x,   y2 = goingDown ? to.y   - r : to.y   + r;
     const midY = (y1 + y2) / 2;
 
     const path = document.createElementNS(SVG_NS, 'path') as SVGPathElement;
     path.setAttribute('class', `archy-mm-edge ${cls}`);
     path.setAttribute('fill', 'none');
-    path.setAttribute('stroke-width', '1.5');
+    path.setAttribute('stroke-width', String(edgeW));
     path.setAttribute('d', `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`);
     layer.appendChild(path);
 }
 
-function drawMmNodeCircle(layer: SVGGElement, node: MmNode, app: App) {
-    const isRoot = node.linkType === 'root';
-    const circleCls = isRoot               ? 'archy-mm-circle archy-mm-circle-root'
+function drawMmNodeCircle(layer: SVGGElement, node: MmNode, app: App, r: number) {
+    const circleCls = node.linkType === 'root'      ? 'archy-mm-circle archy-mm-circle-root'
                     : node.linkType === 'parent'     ? 'archy-mm-circle archy-mm-circle-dependson'
                     : node.linkType === 'informedby' ? 'archy-mm-circle archy-mm-circle-informedby'
                     : 'archy-mm-circle archy-mm-circle-leadsto';
@@ -635,16 +672,14 @@ function drawMmNodeCircle(layer: SVGGElement, node: MmNode, app: App) {
     g.setAttribute('transform', `translate(${node.x}, ${node.y})`);
 
     const circle = document.createElementNS(SVG_NS, 'circle') as SVGCircleElement;
-    circle.setAttribute('cx', '0');
-    circle.setAttribute('cy', '0');
-    circle.setAttribute('r', String(MM_R));
+    circle.setAttribute('cx', '0'); circle.setAttribute('cy', '0');
+    circle.setAttribute('r', String(r));
     circle.setAttribute('class', circleCls);
     g.appendChild(circle);
 
-    // Label — hidden by default, shown on hover (or always when .archy-mm-labels-always)
     const label = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
     label.setAttribute('x', '0');
-    label.setAttribute('y', String(MM_R + 14));
+    label.setAttribute('y', String(r + 14));
     label.setAttribute('text-anchor', 'middle');
     label.setAttribute('class', 'archy-mm-label');
     label.textContent = node.name;
@@ -655,17 +690,18 @@ function drawMmNodeCircle(layer: SVGGElement, node: MmNode, app: App) {
 }
 
 function drawMmSubtree(
-    edgeLayer: SVGGElement,
-    nodeLayer: SVGGElement,
-    node: MmNode,
-    parent: MmNode | null,
-    app: App
+    edgeLayer: SVGGElement, nodeLayer: SVGGElement,
+    node: MmNode, parent: MmNode | null, app: App,
+    r: number, edgeW: number
 ) {
-    if (parent) {
-        drawMmEdge(edgeLayer, parent, node, node.linkType);
-    }
-    drawMmNodeCircle(nodeLayer, node, app);
-    for (const child of node.children) {
-        drawMmSubtree(edgeLayer, nodeLayer, child, node, app);
-    }
+    if (parent) drawMmEdge(edgeLayer, parent, node, node.linkType, r, edgeW);
+    drawMmNodeCircle(nodeLayer, node, app, r);
+    for (const child of node.children) drawMmSubtree(edgeLayer, nodeLayer, child, node, app, r, edgeW);
+}
+
+/** Format a number for display next to its slider. */
+function fmtVal(v: number, step: number): string {
+    if (step >= 1) return String(Math.round(v));
+    const decimals = Math.max(0, String(step).split('.')[1]?.length ?? 2);
+    return v.toFixed(decimals);
 }
