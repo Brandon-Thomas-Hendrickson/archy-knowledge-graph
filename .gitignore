@@ -1,0 +1,17 @@
+# Compiled output — built by CI and bundled into GitHub releases
+main.js
+
+# Node
+node_modules/
+
+# User-specific plugin settings (Obsidian writes this at runtime)
+data.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+

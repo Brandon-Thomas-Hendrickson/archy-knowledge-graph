@@ -1,0 +1,9 @@
+{
+	"id": "archy-knowledge-graph",
+	"name": "Archy – Knowledge Graph",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Hierarchical note linkage using leadsto, dependson, and informedby relationships with a tree visualization.",
+	"author": "Brandon",
+	"isDesktopOnly": false
+}
